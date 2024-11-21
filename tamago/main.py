@@ -1,5 +1,4 @@
-from fastapi import Depends, FastAPI, HTTPException, status, Header, UploadFile, Form, File
-from functools import wraps
+from fastapi import Depends, FastAPI, UploadFile, Form, File
 from pydantic import BaseModel
 from supabase import create_client, Client
 from fastapi.security import OAuth2PasswordBearer
@@ -59,7 +58,7 @@ async def register_user(request: Signup):
 
 @app.post("/logout")
 async def logout_user(token: str = Depends(oauth2_scheme)):
-    auth_response = supabase.auth.sign_out(access_token=token)
+    supabase.auth.sign_out(access_token=token)
 
     return {"message": "ログアウト成功"}
 
@@ -67,7 +66,7 @@ async def logout_user(token: str = Depends(oauth2_scheme)):
 @app.post("/material/input/allmodel")
 async def get_model( request: MaterialInput, token: str = Depends(oauth2_scheme)):
     user_response = supabase.auth.get_user(token)
-    user_id = user_response.user.id
+    current_user_id = user_response.user.id
 
     response = supabase.table("allmodel").select("*").execute()
     data = response.data
@@ -146,11 +145,11 @@ async def get_model(request: MaterialInput, token: str = Depends(oauth2_scheme))
 @app.post("/user/TKG/rating")
 async def rating(request: Rating, token: str = Depends(oauth2_scheme)):
     user_response = supabase.auth.get_user(token)
-    user_id = user_response.user.id
+    current_user_id = user_response.user.id
 
     if request.model == "eachmodel":
        response = (supabase.table("eachmodel").insert({
-            "user_id": user_id,
+            "user_id": current_user_id,
             "rice_amount": request.rice_amount,
             "egg_amount": request.egg_amount,
             "soysauce_amount": request.soysauce_amount,
@@ -183,36 +182,38 @@ async def add_eachmodel(request: Rating, token: str = Depends(oauth2_scheme)):
     return {"message": "評価を保存しました"}
 
 
-@app.post("/post/create/")
-async def create_post(title: str = Form(...), description: str = Form(...), image: UploadFile = File(...), token: str = Depends(oauth2_scheme)):
-    user_response = supabase.auth.get_user(token)
-    user_id = user_response.user.id
-    image_path = f"posts/{uuid4()}"
-    file_content = await image.read()
-    response = supabase.storage.from_("post_image").upload(image_path, file_content, {"content-type": "image/png"})
-    image_url = f"{SUPABASE_URL}/storage/v1/object/public/post_image/{image_path}"
-
-    response = (supabase.table("post").insert({
-        "user_id": user_id,
-        "title": title,
-        "description": description,
-        "image_url": image_url
-    }).execute())
-
-    return {"message": "投稿作成成功"}
-
-
 @app.get("/")
 async def home(token: str = Depends(oauth2_scheme)):
     user_response = supabase.auth.get_user(token)
-    user_id = user_response.user.id
-    username = user_response.user.user_metadata.get('username')
+    current_user_id = user_response.user.id
+    user_data = supabase.table("profile").select("username", "image_url").eq("user_id", current_user_id).execute()
+    username = user_data.data[0]["username"]
+    image_url = user_data.data[0]["image_url"]
 
-    response = supabase.table("notifications").select("*").eq("user_id", user_id).execute()
-
+    response = supabase.table("notifications").select("*").eq("user_id", current_user_id).execute()
     notifications = response.data
 
-    return {"message": "ホームページ", "user_id": user_id, "username": username, "notifications": notifications}
+    posts_response = supabase.table("post").select("*").order("created_at", desc=True).execute()
+    posts = posts_response.data
+
+    return {
+            "user_id": current_user_id, 
+            "username": username, 
+            "user_image_url": image_url, 
+            "posts": posts, 
+            "notifications": notifications
+        }
+
+
+@app.patch("/update_posts_sort") # 投稿一覧をスターの多い順にソート
+async def update_posts_sort(token: str = Depends(oauth2_scheme)):
+    user_response = supabase.auth.get_user(token)
+    current_user_id = user_response.user.id
+
+    posts_response = supabase.table("post").select("*").order("star_count", desc=True).execute()
+    posts = posts_response.data
+
+    return {"posts": posts}
 
 
 @app.get("/profile/{user_id}")
@@ -220,7 +221,9 @@ async def get_profile(user_id: str, token: str = Depends(oauth2_scheme)):
     user_response = supabase.auth.get_user(token)
     current_user_id = user_response.user.id
 
-    username = supabase.table("profile").select("username").eq("user_id", user_id).execute()
+    user_data = supabase.table("profile").select("username", "image_url").eq("user_id", current_user_id).execute()
+    username = user_data.data[0]["username"]
+    image_url = user_data.data[0]["image_url"]
 
     posts_responce = supabase.table("post").select("*").eq("user_id", user_id).execute()
     posts = posts_responce.data
@@ -230,10 +233,10 @@ async def get_profile(user_id: str, token: str = Depends(oauth2_scheme)):
     starred_posts_response = supabase.table("post").select("id").eq("user_id", user_id).eq("stars", 1).execute()
     starred_post_ids = [item["id"] for item in starred_posts_response.data] if starred_posts_response.data else []
 
-    return {"posts": posts, "username": username, "star_count": total_stars, "starred_posts": starred_post_ids}
+    return {"posts": posts, "username": username, "user_image_url": image_url, "star_count": total_stars, "starred_posts": starred_post_ids}
 
 
-@app.post("/profile/{user_id}")
+@app.post("/profile/update/{user_id}")
 async def update_profile(user_id: str, username: str=Form(None), user_image: UploadFile=Form(None), token: str = Depends(oauth2_scheme)):
     user_response = supabase.auth.get_user(token)
     current_user_id = user_response.user.id
@@ -254,12 +257,33 @@ async def update_profile(user_id: str, username: str=Form(None), user_image: Upl
     return {"message": "プロフィールを更新しました", "updated_data": updated_data, "image_url": image_url}
 
 
+@app.post("/post/create/")
+async def create_post(title: str = Form(...), description: str = Form(...), image: UploadFile = File(...), token: str = Depends(oauth2_scheme)):
+    user_response = supabase.auth.get_user(token)
+    user_id = user_response.user.id
+    image_path = f"posts/{uuid4()}"
+    file_content = await image.read()
+    response = supabase.storage.from_("post_image").upload(image_path, file_content, {"content-type": "image/png"})
+    image_url = f"{SUPABASE_URL}/storage/v1/object/public/post_image/{image_path}"
+
+    response = (supabase.table("post").insert({
+        "user_id": user_id,
+        "title": title,
+        "description": description,
+        "image_url": image_url
+    }).execute())
+
+    post_id = response.data[0]["id"]
+
+    return {"post_id": post_id}
+
+
 @app.get("/postdetail/{post_id}")
 async def get_post_detail(post_id: str, token: str = Depends(oauth2_scheme)):
     user_response = supabase.auth.get_user(token)
     current_user_id = user_response.user.id
 
-    response = supabase.table("posts").select("*").eq("post_id", post_id).execute()
+    response = supabase.table("post").select("*").eq("post_id", post_id).execute()
     data = response.data
 
     post_detail = data[0]
@@ -281,7 +305,7 @@ async def add_comment(post_id: str, content: str, token: str = Depends(oauth2_sc
     }
     response = supabase.table("comments").insert(comment_data).execute()
 
-    post_response = supabase.table("post").select("user_id").eq("id", post_id).execute()
+    post_response = supabase.table("post").select("user_id").eq("post_id", post_id).execute()
     author_id = post_response.data[0]["author_id"]
 
     notification_message = "あなたの投稿にコメントがつきました"
